@@ -330,6 +330,10 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       setError(null);
       setNeedsUnmute(false);
 
+      console.debug("[REMOTE] stream:", remoteStream);
+      console.debug("[REMOTE] video tracks:", remoteStream.getVideoTracks());
+      console.debug("[REMOTE] audio tracks:", remoteStream.getAudioTracks());
+
       const video = videoRef.current;
       if (!video) return;
       video.srcObject = remoteStream;
@@ -439,26 +443,36 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   }
 
   async function startSharing() {
+    // Passado como variável (não como literal inline) de propósito: assim
+    // dá pra incluir `systemAudio`, uma extensão do Chrome/Edge ainda fora
+    // dos tipos padrão do TypeScript, sem precisar de `as any`. Ela
+    // sinaliza pro navegador incluir o áudio do sistema por padrão ao
+    // compartilhar a tela inteira/uma janela (sem isso, alguns navegadores
+    // só oferecem a opção de áudio quando se escolhe compartilhar uma aba
+    // específica do próprio navegador).
+    const captureOptions = {
+      video: {
+        // Capturar em 1080p/30fps (em vez do nativo, que pode ser 1440p/4K)
+        // já ajuda bastante na nitidez: o mesmo teto de bitrate rende uma
+        // imagem muito mais limpa em menos pixels.
+        frameRate: { ideal: 30, max: 60 },
+        width: { ideal: 1920, max: 1920 },
+        height: { ideal: 1080, max: 1080 },
+      },
+      audio: {
+        // Desliga processamento de áudio "de chamada" (feito pra voz),
+        // que distorce música/áudio de jogo. Queremos o som do sistema
+        // limpo, sem cancelamento de eco nem compressão automática.
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        systemAudio: "include",
+      },
+    };
+
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          // Capturar em 1080p/30fps (em vez do nativo, que pode ser 1440p/4K)
-          // já ajuda bastante na nitidez: o mesmo teto de bitrate rende uma
-          // imagem muito mais limpa em menos pixels.
-          frameRate: { ideal: 30, max: 60 },
-          width: { ideal: 1920, max: 1920 },
-          height: { ideal: 1080, max: 1080 },
-        },
-        audio: {
-          // Desliga processamento de áudio "de chamada" (feito pra voz),
-          // que distorce música/áudio de jogo. Queremos o som do sistema
-          // limpo, sem cancelamento de eco nem compressão automática.
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
+      stream = await navigator.mediaDevices.getDisplayMedia(captureOptions);
     } catch (err) {
       const domError = err as DOMException;
       if (domError?.name === "NotAllowedError") {
@@ -467,6 +481,24 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
         toast.error("Não foi possível capturar sua tela.");
       }
       return;
+    }
+
+    // Diagnóstico: o pipeline (addTrack → SDP → ICE → ontrack) trata áudio
+    // e vídeo exatamente da mesma forma — não existe filtro nenhum no
+    // código que remova a AudioTrack. Então, se não vier áudio, a causa é
+    // sempre a captura em si (checkbox "Compartilhar áudio" não marcada no
+    // diálogo do navegador, ou o SO/superfície compartilhada não suporta
+    // captura de áudio do sistema — ex: macOS não suporta para tela/janela,
+    // só pra abas do Chrome).
+    console.debug("[SCREEN] stream:", stream);
+    console.debug("[SCREEN] all tracks:", stream.getTracks());
+    console.debug("[SCREEN] video tracks:", stream.getVideoTracks());
+    console.debug("[SCREEN] audio tracks:", stream.getAudioTracks());
+    if (stream.getAudioTracks().length === 0) {
+      toast.warning(
+        "Compartilhando sem áudio — marque \"Compartilhar áudio\" no diálogo do navegador (ou, no Mac, isso só funciona compartilhando uma aba do Chrome).",
+        { duration: 8000 },
+      );
     }
 
     // Derruba a conexão de espectador (ou o host anterior, se veio de um

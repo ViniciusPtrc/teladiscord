@@ -43,24 +43,32 @@ export function RoomClient({ roomId }: { roomId: string }) {
     videoHeight: number;
     paused: boolean;
     muted: boolean;
-    trackCount: number;
+    videoTrackCount: number;
+    audioTrackCount: number;
+    audioTrackEnabled: boolean | null;
   } | null>(null);
 
   // Painel de diagnóstico: só faz polling do elemento <video> enquanto
   // estiver aberto, pra não gastar ciclo nenhum durante o uso normal.
+  // O mesmo elemento é usado tanto pro preview local (host) quanto pro
+  // stream remoto (espectador), então isso serve pros dois casos: mostra
+  // se a AudioTrack realmente existe no stream que está em `srcObject`.
   useEffect(() => {
     if (!showDebug) return;
     const interval = setInterval(() => {
       const video = videoRef.current;
       if (!video) return;
       const stream = video.srcObject as MediaStream | null;
+      const audioTracks = stream?.getAudioTracks() ?? [];
       setVideoStats({
         readyState: video.readyState,
         videoWidth: video.videoWidth,
         videoHeight: video.videoHeight,
         paused: video.paused,
         muted: video.muted,
-        trackCount: stream?.getTracks().length ?? 0,
+        videoTrackCount: stream?.getVideoTracks().length ?? 0,
+        audioTrackCount: audioTracks.length,
+        audioTrackEnabled: audioTracks[0]?.enabled ?? null,
       });
     }, 500);
     return () => clearInterval(interval);
@@ -151,7 +159,16 @@ export function RoomClient({ roomId }: { roomId: string }) {
                 </span>
                 <span>video.paused: {String(videoStats.paused)}</span>
                 <span>video.muted: {String(videoStats.muted)}</span>
-                <span>tracks: {videoStats.trackCount}</span>
+                <span>video tracks: {videoStats.videoTrackCount}</span>
+                <span
+                  className={
+                    videoStats.audioTrackCount === 0 ? "text-destructive" : undefined
+                  }
+                >
+                  audio tracks: {videoStats.audioTrackCount}
+                  {videoStats.audioTrackCount > 0 &&
+                    ` (enabled: ${String(videoStats.audioTrackEnabled)})`}
+                </span>
               </>
             )}
           </div>
