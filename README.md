@@ -34,9 +34,33 @@ para seus amigos (ex: cole no chat da call do Discord).
   PeerJS Cloud — o vídeo em si nunca passa por ele, só o "aperto de mão"
   inicial da conexão P2P. Para uso mais pesado/produção, o recomendado é
   subir seu próprio [PeerServer](https://github.com/peers/peerjs-server).
-- Como fallback de rede (NAT restritivo, 4G, etc.) o hook já inclui um
-  servidor STUN do Google e um TURN público (Open Relay) além da conexão
-  P2P direta, para aumentar a chance de conexão bem-sucedida.
+- Como fallback de rede (NAT restritivo, 4G, operadoras diferentes etc.) o
+  hook usa STUN do Google + um relay TURN. **O TURN precisa de credenciais
+  próprias** (grátis) para funcionar de forma confiável — veja a seção
+  abaixo. Sem isso, a conexão direta P2P funciona bem entre a maioria das
+  redes residenciais, mas pode falhar entre redes mais restritivas.
+
+## Configurando o TURN (recomendado — resolve "fica procurando host")
+
+Se alguém consegue entrar na sala (o contador de espectadores do host sobe)
+mas o vídeo nunca chega, é falta de um relay TURN funcional — STUN sozinho
+não atravessa todo tipo de NAT/firewall.
+
+1. Crie uma conta grátis em [dashboard.metered.ca/signup](https://dashboard.metered.ca/signup)
+2. No painel, vá em **Turn Server** / **Open Relay** e copie o **App Name**
+   e a **API Key**
+3. Copie `.env.local.example` para `.env.local` e preencha:
+   ```
+   NEXT_PUBLIC_METERED_APP_NAME=seu-app
+   NEXT_PUBLIC_METERED_API_KEY=sua-api-key
+   ```
+4. Reinicie o `npm run dev` (ou refaça o deploy)
+
+Free tier: 20 GB/mês de tráfego TURN — de sobra para um grupo de amigos.
+
+**Debug rápido:** abra o DevTools (F12) → Console de quem está travado. O
+hook loga o estado da conexão ICE (`[useWebRTC] ... iceConnectionState: ...`).
+Se ficar preso em `checking` ou virar `failed`, é sinal de que falta TURN.
 
 ## Limitações conhecidas
 

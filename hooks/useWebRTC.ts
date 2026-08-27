@@ -6,29 +6,55 @@ import type Peer from "peerjs";
 import type { MediaConnection, PeerError, PeerErrorType } from "peerjs";
 
 /**
- * Servidores ICE usados pelas conexões WebRTC.
- *
- * Além do STUN público do Google, incluímos um TURN público (Open Relay)
- * como fallback para quando algum dos pares está atrás de um NAT
- * restritivo/simétrico (comum em redes de faculdade, 4G, algumas operadoras
- * de internet residencial etc.) e a conexão direta P2P não é possível.
- *
- * Para um app em produção, o ideal é rodar seu próprio TURN server, mas
- * isso é suficiente para uso entre amigos.
+ * Servidores STUN públicos usados como base — ajudam dois pares a descobrir
+ * seus endereços públicos, mas sozinhos NÃO atravessam NATs restritivos
+ * (comum em redes 4G, CGNAT de operadoras residenciais, redes corporativas
+ * etc.). Nesses casos é obrigatório um relay TURN — ver `getIceServers`.
  */
-const ICE_SERVERS: RTCIceServer[] = [
+const STUN_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
-  {
-    urls: "turn:openrelay.metered.ca:80",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
-  {
-    urls: "turn:openrelay.metered.ca:443",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
+  { urls: "stun:stun1.l.google.com:19302" },
 ];
+
+/**
+ * Credenciais TURN gratuitas do Open Relay Project (via metered.ca).
+ *
+ * Diferente do STUN, um TURN precisa de credenciais válidas e com cota —
+ * por isso são geradas dinamicamente a partir de uma conta gratuita
+ * (NEXT_PUBLIC_METERED_APP_NAME / NEXT_PUBLIC_METERED_API_KEY no .env.local),
+ * em vez de usar credenciais estáticas/compartilhadas publicadas em
+ * tutoriais (essas ficam sobrecarregadas e não são confiáveis). Sem essas
+ * variáveis configuradas, o app cai de volta para STUN-only, que funciona
+ * bem entre a maioria das redes residenciais, mas pode falhar quando algum
+ * dos dois lados está atrás de um NAT mais restritivo.
+ */
+let cachedIceServersPromise: Promise<RTCIceServer[]> | null = null;
+
+async function getIceServers(): Promise<RTCIceServer[]> {
+  if (cachedIceServersPromise) return cachedIceServersPromise;
+
+  cachedIceServersPromise = (async () => {
+    const appName = process.env.NEXT_PUBLIC_METERED_APP_NAME;
+    const apiKey = process.env.NEXT_PUBLIC_METERED_API_KEY;
+    if (!appName || !apiKey) return STUN_SERVERS;
+
+    try {
+      const res = await fetch(
+        `https://${appName}.metered.live/api/v1/turn/credentials?apiKey=${apiKey}`,
+      );
+      if (!res.ok) return STUN_SERVERS;
+      const turnServers = (await res.json()) as RTCIceServer[];
+      if (!Array.isArray(turnServers) || turnServers.length === 0) {
+        return STUN_SERVERS;
+      }
+      return [...STUN_SERVERS, ...turnServers];
+    } catch {
+      return STUN_SERVERS;
+    }
+  })();
+
+  return cachedIceServersPromise;
+}
 
 const RETRY_DELAY_MS = 3000;
 
@@ -151,6 +177,21 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   // naturalmente cíclico (ex: uma chamada que cai agenda uma nova tentativa,
   // que por sua vez pode recriar a chamada).
 
+  /**
+   * Loga mudanças de estado da conexão ICE no console — não afeta a UI,
+   * mas é a forma mais rápida de diagnosticar por que uma chamada nunca
+   * chega a "connected" (ex: falha de NAT/TURN) quando alguém reportar
+   * problema. Abra o DevTools (F12) do lado que está travado.
+   */
+  function logIceState(label: string, peerConnection: RTCPeerConnection) {
+    peerConnection.addEventListener("iceconnectionstatechange", () => {
+      console.debug(`[useWebRTC] ${label} iceConnectionState:`, peerConnection.iceConnectionState);
+    });
+    peerConnection.addEventListener("connectionstatechange", () => {
+      console.debug(`[useWebRTC] ${label} connectionState:`, peerConnection.connectionState);
+    });
+  }
+
   function clearRetry() {
     if (retryTimeoutRef.current) {
       clearTimeout(retryTimeoutRef.current);
@@ -198,6 +239,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       return;
     }
     viewerCallRef.current = call;
+    logIceState("espectador", call.peerConnection);
 
     call.on("stream", (remoteStream) => {
       if (!mountedRef.current) return;
@@ -229,10 +271,13 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     clearRetry();
     setStatus("connecting");
 
-    const { default: PeerCtor } = await import("peerjs");
+    const [{ default: PeerCtor }, iceServers] = await Promise.all([
+      import("peerjs"),
+      getIceServers(),
+    ]);
     if (!mountedRef.current || isHostRef.current) return;
 
-    const peer = new PeerCtor({ config: { iceServers: ICE_SERVERS } });
+    const peer = new PeerCtor({ config: { iceServers } });
     peerRef.current = peer;
 
     peer.on("open", () => {
@@ -343,10 +388,13 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       if (mountedRef.current) stopSharing();
     });
 
-    const { default: PeerCtor } = await import("peerjs");
+    const [{ default: PeerCtor }, iceServers] = await Promise.all([
+      import("peerjs"),
+      getIceServers(),
+    ]);
     if (!mountedRef.current) return;
 
-    const peer = new PeerCtor(roomId, { config: { iceServers: ICE_SERVERS } });
+    const peer = new PeerCtor(roomId, { config: { iceServers } });
     peerRef.current = peer;
 
     peer.on("open", () => {
@@ -358,6 +406,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     peer.on("call", (call) => {
       call.answer(localStreamRef.current ?? undefined);
       applyHighQualityEncoding(call.peerConnection);
+      logIceState(`espectador ${call.peer}`, call.peerConnection);
       hostCallsRef.current.set(call.peer, call);
       setViewerCount(hostCallsRef.current.size);
 
