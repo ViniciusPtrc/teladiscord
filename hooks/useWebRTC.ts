@@ -231,7 +231,19 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     }
   }
 
-  function destroyPeer() {
+  /**
+   * Destrói o peer atual e só resolve quando o servidor de sinalização
+   * confirma o encerramento (evento "close").
+   *
+   * Isso importa especialmente pro HOST: `peer.destroy()` manda o pedido de
+   * encerramento pro broker do PeerJS de forma assíncrona — se o mesmo
+   * usuário clicar em "Compartilhar Tela" de novo rápido demais, uma nova
+   * tentativa de reivindicar `roomId` pode chegar ao servidor ANTES dele
+   * processar a liberação do ID anterior, e o servidor recusa com
+   * "unavailable-id" (que o app então mostra, errado, como "outra pessoa
+   * já está compartilhando"). Esperar o "close" evita essa corrida.
+   */
+  function destroyPeer(): Promise<void> {
     clearRetry();
     viewerHandshakeRef.current?.close();
     viewerHandshakeRef.current = null;
@@ -239,10 +251,28 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     viewerCallRef.current = null;
     hostCallsRef.current.forEach((call) => call.close());
     hostCallsRef.current.clear();
-    if (peerRef.current && !peerRef.current.destroyed) {
-      peerRef.current.destroy();
-    }
+
+    const peer = peerRef.current;
     peerRef.current = null;
+
+    if (!peer || peer.destroyed) return Promise.resolve();
+
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      // Rede de segurança: se por algum motivo o evento "close" nunca
+      // disparar, não trava o app pra sempre — só demora um pouco mais.
+      const timeout = setTimeout(done, 1500);
+      peer.on("close", () => {
+        clearTimeout(timeout);
+        done();
+      });
+      peer.destroy();
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -338,7 +368,8 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     // órfãs até o navegador recusar criar mais ("Cannot create so many
     // PeerConnections") — foi exatamente isso que aconteceu numa sessão
     // de teste mais longa.
-    destroyPeer();
+    await destroyPeer();
+    if (!mountedRef.current || isHostRef.current) return;
     setStatus("connecting");
 
     const [{ default: PeerCtor }, iceServers] = await Promise.all([
@@ -382,7 +413,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   // Fluxo de HOST
   // -----------------------------------------------------------------------
 
-  function stopSharing() {
+  async function stopSharing() {
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     localStreamRef.current = null;
 
@@ -394,7 +425,11 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       videoRef.current.srcObject = null;
     }
 
-    destroyPeer();
+    // Espera o servidor confirmar que o ID da sala foi liberado antes de
+    // seguir — evita que um "Compartilhar Tela" rápido logo em seguida
+    // (nosso ou de outra pessoa) esbarre num "unavailable-id" falso.
+    await destroyPeer();
+    if (!mountedRef.current) return;
     isHostRef.current = false;
     setIsHost(false);
     setStatus("idle");
@@ -434,8 +469,15 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       return;
     }
 
-    // Derruba a conexão de espectador antes de assumir o papel de host.
-    destroyPeer();
+    // Derruba a conexão de espectador (ou o host anterior, se veio de um
+    // stopSharing()+startSharing() rápido) e SÓ SEGUE depois do servidor
+    // confirmar o encerramento — é essa espera que evita o falso
+    // "unavailable-id" ao tentar reivindicar `roomId` de novo rápido demais.
+    await destroyPeer();
+    if (!mountedRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
 
     // Sinaliza ao codificador de vídeo do navegador para priorizar
     // detalhe/nitidez em vez de suavidade de movimento — ideal para telas
@@ -460,7 +502,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     // Se o usuário parar o compartilhamento pelo próprio painel do
     // navegador ("Parar apresentação"), encerramos a transmissão também.
     stream.getVideoTracks()[0]?.addEventListener("ended", () => {
-      if (mountedRef.current) stopSharing();
+      if (mountedRef.current) void stopSharing();
     });
 
     const [{ default: PeerCtor }, iceServers] = await Promise.all([
@@ -469,57 +511,77 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     ]);
     if (!mountedRef.current) return;
 
-    const peer = new PeerCtor(roomId, { config: { iceServers } });
-    peerRef.current = peer;
+    // Tenta reivindicar `roomId` como Peer ID. Se o servidor recusar por
+    // "unavailable-id" logo de cara, tenta mais algumas vezes antes de
+    // concluir que é realmente outra pessoa — é uma segunda camada de
+    // proteção contra a mesma corrida que o `await destroyPeer()` acima já
+    // deveria ter evitado (defesa extra caso o servidor demore um pouco
+    // mais que o normal pra liberar o ID anterior).
+    const MAX_CLAIM_RETRIES = 2;
+    const CLAIM_RETRY_DELAY_MS = 600;
 
-    peer.on("open", () => {
-      if (!mountedRef.current) return;
-      setStatus("sharing");
-      toast.success("Você está transmitindo sua tela!");
-    });
+    function claimHostPeer(retriesLeft: number) {
+      const peer = new PeerCtor(roomId, { config: { iceServers } });
+      peerRef.current = peer;
 
-    // Um espectador avisa presença via conexão de dados — o host é quem
-    // liga de volta com o stream de verdade (ver comentário no topo do
-    // arquivo sobre por que a chamada precisa partir de quem tem a mídia).
-    peer.on("connection", (dataConnection) => {
-      if (!mountedRef.current || !localStreamRef.current) return;
-
-      const call = peer.call(dataConnection.peer, localStreamRef.current);
-      if (!call) return;
-
-      applyHighQualityEncoding(call.peerConnection);
-      logIceState(`espectador ${dataConnection.peer}`, call.peerConnection);
-      hostCallsRef.current.set(dataConnection.peer, call);
-      setViewerCount(hostCallsRef.current.size);
-
-      const cleanup = () => {
-        hostCallsRef.current.delete(dataConnection.peer);
-        setViewerCount(hostCallsRef.current.size);
-      };
-
-      dataConnection.on("close", () => {
-        call.close();
-        cleanup();
+      peer.on("open", () => {
+        if (!mountedRef.current) return;
+        setStatus("sharing");
+        toast.success("Você está transmitindo sua tela!");
       });
-      call.on("close", cleanup);
-      call.on("error", cleanup);
-    });
 
-    peer.on("error", (err) => {
-      if (!mountedRef.current) return;
-      if (err.type === "unavailable-id") {
-        toast.error("Alguém já está compartilhando a tela nesta sala.");
-        stopSharing();
-        return;
-      }
-      setError(friendlyPeerError(err));
-      toast.error(friendlyPeerError(err));
-    });
+      // Um espectador avisa presença via conexão de dados — o host é quem
+      // liga de volta com o stream de verdade (ver comentário no topo do
+      // arquivo sobre por que a chamada precisa partir de quem tem a mídia).
+      peer.on("connection", (dataConnection) => {
+        if (!mountedRef.current || !localStreamRef.current) return;
 
-    peer.on("disconnected", () => {
-      if (!mountedRef.current) return;
-      if (!peer.destroyed) peer.reconnect();
-    });
+        const call = peer.call(dataConnection.peer, localStreamRef.current);
+        if (!call) return;
+
+        applyHighQualityEncoding(call.peerConnection);
+        logIceState(`espectador ${dataConnection.peer}`, call.peerConnection);
+        hostCallsRef.current.set(dataConnection.peer, call);
+        setViewerCount(hostCallsRef.current.size);
+
+        const cleanup = () => {
+          hostCallsRef.current.delete(dataConnection.peer);
+          setViewerCount(hostCallsRef.current.size);
+        };
+
+        dataConnection.on("close", () => {
+          call.close();
+          cleanup();
+        });
+        call.on("close", cleanup);
+        call.on("error", cleanup);
+      });
+
+      peer.on("error", (err) => {
+        if (!mountedRef.current) return;
+        if (err.type === "unavailable-id") {
+          if (retriesLeft > 0) {
+            setTimeout(() => {
+              if (!mountedRef.current || !isHostRef.current) return;
+              claimHostPeer(retriesLeft - 1);
+            }, CLAIM_RETRY_DELAY_MS);
+            return;
+          }
+          toast.error("Alguém já está compartilhando a tela nesta sala.");
+          void stopSharing();
+          return;
+        }
+        setError(friendlyPeerError(err));
+        toast.error(friendlyPeerError(err));
+      });
+
+      peer.on("disconnected", () => {
+        if (!mountedRef.current) return;
+        if (!peer.destroyed) peer.reconnect();
+      });
+    }
+
+    claimHostPeer(MAX_CLAIM_RETRIES);
   }
 
   /** Chamado pelo clique do usuário no botão "Ativar som" — libera o áudio. */
@@ -543,7 +605,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       mountedRef.current = false;
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
-      destroyPeer();
+      void destroyPeer();
     };
     // Reconecta do zero caso o ID da sala mude (navegação entre salas).
     // eslint-disable-next-line react-hooks/exhaustive-deps
