@@ -64,6 +64,19 @@ async function getIceServers(): Promise<RTCIceServer[]> {
 const RETRY_DELAY_MS = 3000;
 
 /**
+ * Tipos de erro tratados como instabilidade passageira do servidor de
+ * sinalização (0.peerjs.com é um servidor de demonstração gratuito, sem
+ * garantia de uptime) — vale tentar de novo antes de desistir.
+ */
+const TRANSIENT_ERROR_TYPES = new Set<`${PeerErrorType}`>([
+  "network",
+  "server-error",
+  "socket-error",
+  "socket-closed",
+]);
+const MAX_TRANSIENT_RETRIES = 5;
+
+/**
  * Teto de bitrate de vídeo em bits/s. O WebRTC, por padrão, usa um bitrate
  * bem conservador — em telas com muito texto/UI (como um jogo de estratégia
  * ou uma planilha) isso aparece como uma imagem "borrada"/comprimida. 8 Mbps
@@ -200,6 +213,9 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   /** Chamadas de vídeo que o host está enviando, por peerId do espectador. */
   const hostCallsRef = useRef<Map<string, MediaConnection>>(new Map());
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Conta erros transitórios seguidos do servidor de sinalização, pra
+   * limitar quantas vezes tentamos de novo antes de desistir de vez. */
+  const transientErrorCountRef = useRef(0);
   const isHostRef = useRef(false);
   const mountedRef = useRef(true);
 
@@ -387,6 +403,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
 
     peer.on("open", () => {
       if (!mountedRef.current || isHostRef.current) return;
+      transientErrorCountRef.current = 0;
       handshakeWithHost(peer);
     });
 
@@ -400,6 +417,15 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       if (err.type === "peer-unavailable") {
         // O host ainda não subiu a transmissão nesta sala. Continua tentando.
         setStatus("waiting-host");
+        scheduleViewerRetry();
+        return;
+      }
+      if (TRANSIENT_ERROR_TYPES.has(err.type) && transientErrorCountRef.current < MAX_TRANSIENT_RETRIES) {
+        // Instabilidade passageira no servidor de sinalização (é um
+        // servidor de demonstração gratuito do PeerJS, sem SLA) — tenta
+        // de novo algumas vezes antes de desistir e mostrar erro fatal.
+        transientErrorCountRef.current += 1;
+        setStatus("connecting");
         scheduleViewerRetry();
         return;
       }
