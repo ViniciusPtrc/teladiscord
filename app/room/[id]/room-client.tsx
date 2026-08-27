@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft,
+  Bug,
   Copy,
   Loader2,
   MonitorOff,
@@ -29,11 +30,41 @@ export function RoomClient({ roomId }: { roomId: string }) {
     error,
     needsUnmute,
     unmute,
+    iceState,
     startSharing,
     stopSharing,
   } = useWebRTC(roomId);
 
   const [isStarting, setIsStarting] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
+  const [videoStats, setVideoStats] = useState<{
+    readyState: number;
+    videoWidth: number;
+    videoHeight: number;
+    paused: boolean;
+    muted: boolean;
+    trackCount: number;
+  } | null>(null);
+
+  // Painel de diagnóstico: só faz polling do elemento <video> enquanto
+  // estiver aberto, pra não gastar ciclo nenhum durante o uso normal.
+  useEffect(() => {
+    if (!showDebug) return;
+    const interval = setInterval(() => {
+      const video = videoRef.current;
+      if (!video) return;
+      const stream = video.srcObject as MediaStream | null;
+      setVideoStats({
+        readyState: video.readyState,
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+        paused: video.paused,
+        muted: video.muted,
+        trackCount: stream?.getTracks().length ?? 0,
+      });
+    }, 500);
+    return () => clearInterval(interval);
+  }, [showDebug, videoRef]);
 
   const handleShareClick = useCallback(async () => {
     setIsStarting(true);
@@ -91,8 +122,41 @@ export function RoomClient({ roomId }: { roomId: string }) {
             <StatusIndicator status={status} isSharing={isSharing} viewerCount={viewerCount} />
           </div>
         </div>
-        <ThemeToggle />
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Diagnóstico da conexão"
+            onClick={() => setShowDebug((v) => !v)}
+          >
+            <Bug className="size-4" />
+          </Button>
+          <ThemeToggle />
+        </div>
       </header>
+
+      {showDebug && (
+        <div className="border-b border-border bg-card/60 px-4 py-2 font-mono text-[11px] text-muted-foreground sm:px-6">
+          <div className="flex flex-wrap gap-x-4 gap-y-1">
+            <span>status: {status}</span>
+            <span>isHost: {String(isHost)}</span>
+            <span>viewerCount: {viewerCount}</span>
+            <span>iceState: {iceState}</span>
+            <span>needsUnmute: {String(needsUnmute)}</span>
+            {videoStats && (
+              <>
+                <span>video.readyState: {videoStats.readyState}</span>
+                <span>
+                  video.size: {videoStats.videoWidth}x{videoStats.videoHeight}
+                </span>
+                <span>video.paused: {String(videoStats.paused)}</span>
+                <span>video.muted: {String(videoStats.muted)}</span>
+                <span>tracks: {videoStats.trackCount}</span>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       <main className="relative flex flex-1 items-center justify-center overflow-hidden bg-black p-2 sm:p-4">
         <div className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-xl bg-zinc-950">

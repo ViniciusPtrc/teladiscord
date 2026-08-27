@@ -132,6 +132,8 @@ interface UseWebRTCResult {
    * navegador — mostrar um botão "Ativar som" que chama `unmute()`. */
   needsUnmute: boolean;
   unmute: () => void;
+  /** Estado ICE da conexão principal — só para diagnóstico. */
+  iceState: RTCIceConnectionState | "idle";
   startSharing: () => Promise<void>;
   stopSharing: () => void;
 }
@@ -184,6 +186,10 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   /** true quando o navegador bloqueou o autoplay com som e o vídeo está
    * tocando mudo até o espectador clicar em "ativar som". */
   const [needsUnmute, setNeedsUnmute] = useState(false);
+  /** Último iceConnectionState conhecido da conexão principal (espectador
+   * assistindo, ou host com pelo menos um espectador) — só para o painel
+   * de diagnóstico, não afeta o fluxo. */
+  const [iceState, setIceState] = useState<RTCIceConnectionState | "idle">("idle");
 
   const peerRef = useRef<Peer | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -211,6 +217,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   function logIceState(label: string, peerConnection: RTCPeerConnection) {
     peerConnection.addEventListener("iceconnectionstatechange", () => {
       console.debug(`[useWebRTC] ${label} iceConnectionState:`, peerConnection.iceConnectionState);
+      if (mountedRef.current) setIceState(peerConnection.iceConnectionState);
     });
     peerConnection.addEventListener("connectionstatechange", () => {
       console.debug(`[useWebRTC] ${label} connectionState:`, peerConnection.connectionState);
@@ -551,6 +558,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     error,
     needsUnmute,
     unmute,
+    iceState,
     startSharing,
     stopSharing,
   };
