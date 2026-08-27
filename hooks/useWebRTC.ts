@@ -3,7 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import type Peer from "peerjs";
-import type { MediaConnection, PeerError, PeerErrorType } from "peerjs";
+import type {
+  DataConnection,
+  MediaConnection,
+  PeerError,
+  PeerErrorType,
+} from "peerjs";
 
 /**
  * Servidores STUN públicos usados como base — ajudam dois pares a descobrir
@@ -154,7 +159,16 @@ function friendlyPeerError(err: PeerError<`${PeerErrorType}`>): string {
  *   "Compartilhar Tela").
  * - Quando o próprio cliente clica em "Compartilhar Tela", ele assume o
  *   papel de host: derruba sua conexão de espectador e sobe um peer com
- *   ID = roomId, respondendo a chamadas dos demais espectadores.
+ *   ID = roomId.
+ *
+ * Detalhe importante do fluxo espectador→host: quem faz a *chamada* de
+ * vídeo (`peer.call`) é sempre o HOST, nunca o espectador. Se o espectador
+ * chamasse o host sem ter nenhuma faixa de vídeo/áudio própria pra mandar,
+ * a oferta SDP nasceria sem nenhuma faixa de mídia — e o WebRTC não permite
+ * adicionar faixas na resposta que não existiam na oferta original, então
+ * o vídeo do host nunca chegaria (mesmo com a conexão ICE "conectada").
+ * Por isso o espectador só avisa sua presença via uma conexão de dados
+ * (`peer.connect`) e é o host quem liga de volta com o stream de verdade.
  */
 export function useWebRTC(roomId: string): UseWebRTCResult {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -166,7 +180,11 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
 
   const peerRef = useRef<Peer | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  /** Conexão de dados usada só pra avisar "estou aqui" pro host (espectador). */
+  const viewerHandshakeRef = useRef<DataConnection | null>(null);
+  /** Chamada de vídeo recebida do host (espectador). */
   const viewerCallRef = useRef<MediaConnection | null>(null);
+  /** Chamadas de vídeo que o host está enviando, por peerId do espectador. */
   const hostCallsRef = useRef<Map<string, MediaConnection>>(new Map());
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isHostRef = useRef(false);
@@ -201,6 +219,8 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
 
   function destroyPeer() {
     clearRetry();
+    viewerHandshakeRef.current?.close();
+    viewerHandshakeRef.current = null;
     viewerCallRef.current?.close();
     viewerCallRef.current = null;
     hostCallsRef.current.forEach((call) => call.close());
@@ -217,28 +237,46 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
 
   function scheduleViewerRetry() {
     clearRetry();
+    // Sempre recomeça do zero (peer novo, handshake novo) em vez de tentar
+    // reaproveitar o peer atual — é mais lento por poucos ms, mas evita
+    // qualquer estado zumbi de uma tentativa anterior que deu errado.
     retryTimeoutRef.current = setTimeout(() => {
       if (!mountedRef.current || isHostRef.current) return;
-      const peer = peerRef.current;
-      if (peer && !peer.destroyed && peer.open) {
-        placeCallToHost(peer);
-      } else {
-        void connectAsViewer();
-      }
+      void connectAsViewer();
     }, RETRY_DELAY_MS);
   }
 
-  function placeCallToHost(peer: Peer) {
+  /** Avisa o host "estou aqui, quero assistir" — não carrega vídeo nenhum. */
+  function handshakeWithHost(peer: Peer) {
     setStatus("connecting");
 
-    // Chamada "somente recebimento": não enviamos nenhuma faixa de mídia,
-    // só usamos a chamada para receber o stream do host.
-    const call = peer.call(roomId, new MediaStream());
-    if (!call) {
+    const handshake = peer.connect(roomId, { reliable: true });
+    viewerHandshakeRef.current = handshake;
+
+    // Rede de segurança: se o host não retornar com uma chamada de vídeo em
+    // alguns segundos, recomeça. É cancelada assim que o stream chegar
+    // (ver clearRetry() dentro de handleIncomingCall).
+    scheduleViewerRetry();
+
+    handshake.on("close", () => {
+      if (!mountedRef.current || isHostRef.current) return;
+      viewerHandshakeRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+      setStatus("waiting-host");
       scheduleViewerRetry();
-      return;
-    }
+    });
+
+    handshake.on("error", () => {
+      if (!mountedRef.current || isHostRef.current) return;
+      setStatus("waiting-host");
+      scheduleViewerRetry();
+    });
+  }
+
+  /** O host ligou de volta com o stream de verdade — só aceitamos. */
+  function handleIncomingCall(call: MediaConnection) {
     viewerCallRef.current = call;
+    call.answer();
     logIceState("espectador", call.peerConnection);
 
     call.on("stream", (remoteStream) => {
@@ -268,7 +306,12 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
 
   async function connectAsViewer() {
     if (isHostRef.current) return;
-    clearRetry();
+    // Sempre destrói qualquer peer/conexão anterior antes de criar um novo.
+    // Sem isso, cada nova tentativa (a cada retry) acumula RTCPeerConnections
+    // órfãs até o navegador recusar criar mais ("Cannot create so many
+    // PeerConnections") — foi exatamente isso que aconteceu numa sessão
+    // de teste mais longa.
+    destroyPeer();
     setStatus("connecting");
 
     const [{ default: PeerCtor }, iceServers] = await Promise.all([
@@ -282,7 +325,12 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
 
     peer.on("open", () => {
       if (!mountedRef.current || isHostRef.current) return;
-      placeCallToHost(peer);
+      handshakeWithHost(peer);
+    });
+
+    peer.on("call", (call) => {
+      if (!mountedRef.current || isHostRef.current) return;
+      handleIncomingCall(call);
     });
 
     peer.on("error", (err) => {
@@ -403,21 +451,31 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       toast.success("Você está transmitindo sua tela!");
     });
 
-    peer.on("call", (call) => {
-      call.answer(localStreamRef.current ?? undefined);
+    // Um espectador avisa presença via conexão de dados — o host é quem
+    // liga de volta com o stream de verdade (ver comentário no topo do
+    // arquivo sobre por que a chamada precisa partir de quem tem a mídia).
+    peer.on("connection", (dataConnection) => {
+      if (!mountedRef.current || !localStreamRef.current) return;
+
+      const call = peer.call(dataConnection.peer, localStreamRef.current);
+      if (!call) return;
+
       applyHighQualityEncoding(call.peerConnection);
-      logIceState(`espectador ${call.peer}`, call.peerConnection);
-      hostCallsRef.current.set(call.peer, call);
+      logIceState(`espectador ${dataConnection.peer}`, call.peerConnection);
+      hostCallsRef.current.set(dataConnection.peer, call);
       setViewerCount(hostCallsRef.current.size);
 
-      call.on("close", () => {
-        hostCallsRef.current.delete(call.peer);
+      const cleanup = () => {
+        hostCallsRef.current.delete(dataConnection.peer);
         setViewerCount(hostCallsRef.current.size);
+      };
+
+      dataConnection.on("close", () => {
+        call.close();
+        cleanup();
       });
-      call.on("error", () => {
-        hostCallsRef.current.delete(call.peer);
-        setViewerCount(hostCallsRef.current.size);
-      });
+      call.on("close", cleanup);
+      call.on("error", cleanup);
     });
 
     peer.on("error", (err) => {
