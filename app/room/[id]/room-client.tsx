@@ -132,10 +132,6 @@ export function RoomClient({ roomId }: { roomId: string }) {
                     : "Procurando o host desta sala."}
                 </p>
               </div>
-              <Button onClick={handleShareClick} disabled={isStarting} className="gap-2">
-                <MonitorUp className="size-4" />
-                Compartilhar minha tela
-              </Button>
             </div>
           )}
 
