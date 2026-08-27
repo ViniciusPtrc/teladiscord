@@ -61,7 +61,17 @@ async function getIceServers(): Promise<RTCIceServer[]> {
   return cachedIceServersPromise;
 }
 
-const RETRY_DELAY_MS = 3000;
+/**
+ * Atraso das novas tentativas de conexão, com backoff exponencial (3s, 6s,
+ * 12s... até um teto de 20s). Um atraso fixo e curto (ficamos com 3s fixos
+ * antes) bombardeia o broker de sinalização com pedidos de WebSocket com
+ * frequência alta — exatamente o tipo de padrão que aciona rate limit
+ * (confirmado: `0.peerjs.com/peerjs` chegou a devolver HTTP 429 do
+ * Cloudflare por causa disso). Backoff crescente reduz esse volume e ainda
+ * assim recupera sozinho quando o servidor volta a aceitar conexões.
+ */
+const RETRY_BASE_DELAY_MS = 3000;
+const RETRY_MAX_DELAY_MS = 20000;
 
 /**
  * Tipos de erro tratados como instabilidade passageira do servidor de
@@ -213,8 +223,15 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   /** Chamadas de vídeo que o host está enviando, por peerId do espectador. */
   const hostCallsRef = useRef<Map<string, MediaConnection>>(new Map());
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Conta erros transitórios seguidos do servidor de sinalização, pra
-   * limitar quantas vezes tentamos de novo antes de desistir de vez. */
+  /** Quantas tentativas seguidas sem sucesso real (nunca chegou a
+   * "watching") — usado só pra calcular o backoff crescente do delay entre
+   * tentativas. Reseta quando o espectador realmente começa a assistir. */
+  const retryAttemptRef = useRef(0);
+  /** Conta especificamente erros de sinalização (rede/servidor) seguidos,
+   * pra limitar quantas vezes tentamos de novo antes de desistir de vez e
+   * mostrar erro fatal. Diferente de "sala vazia" (peer-unavailable), que
+   * pode ficar tentando pra sempre — reseta assim que o peer conecta com
+   * sucesso ao servidor de sinalização (evento "open"). */
   const transientErrorCountRef = useRef(0);
   const isHostRef = useRef(false);
   const mountedRef = useRef(true);
@@ -297,13 +314,21 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
 
   function scheduleViewerRetry() {
     clearRetry();
+    // Backoff exponencial: cada tentativa nova espera mais que a anterior
+    // (3s, 6s, 12s... até 20s), pra não bombardear o broker de sinalização
+    // com pedidos de WebSocket com frequência alta.
+    const delay = Math.min(
+      RETRY_BASE_DELAY_MS * 2 ** retryAttemptRef.current,
+      RETRY_MAX_DELAY_MS,
+    );
+    retryAttemptRef.current += 1;
     // Sempre recomeça do zero (peer novo, handshake novo) em vez de tentar
     // reaproveitar o peer atual — é mais lento por poucos ms, mas evita
     // qualquer estado zumbi de uma tentativa anterior que deu errado.
     retryTimeoutRef.current = setTimeout(() => {
       if (!mountedRef.current || isHostRef.current) return;
       void connectAsViewer();
-    }, RETRY_DELAY_MS);
+    }, delay);
   }
 
   /** Avisa o host "estou aqui, quero assistir" — não carrega vídeo nenhum. */
@@ -342,6 +367,7 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     call.on("stream", (remoteStream) => {
       if (!mountedRef.current) return;
       clearRetry();
+      retryAttemptRef.current = 0;
       setStatus("watching");
       setError(null);
       setNeedsUnmute(false);
