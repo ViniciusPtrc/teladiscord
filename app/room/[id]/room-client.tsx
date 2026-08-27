@@ -10,6 +10,7 @@ import {
   MonitorUp,
   Radio,
   Users,
+  Volume2,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -26,6 +27,8 @@ export function RoomClient({ roomId }: { roomId: string }) {
     isSharing,
     viewerCount,
     error,
+    needsUnmute,
+    unmute,
     startSharing,
     stopSharing,
   } = useWebRTC(roomId);
@@ -132,6 +135,15 @@ export function RoomClient({ roomId }: { roomId: string }) {
                     : "Procurando o host desta sala."}
                 </p>
               </div>
+            </div>
+          )}
+
+          {needsUnmute && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/40">
+              <Button onClick={unmute} className="gap-2 rounded-full shadow-lg">
+                <Volume2 className="size-4" />
+                Ativar som
+              </Button>
             </div>
           )}
 

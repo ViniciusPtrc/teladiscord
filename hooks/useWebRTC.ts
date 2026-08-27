@@ -128,6 +128,10 @@ interface UseWebRTCResult {
   viewerCount: number;
   /** Mensagem de erro amigável, se houver. */
   error: string | null;
+  /** true quando o vídeo está tocando mudo por bloqueio de autoplay do
+   * navegador — mostrar um botão "Ativar som" que chama `unmute()`. */
+  needsUnmute: boolean;
+  unmute: () => void;
   startSharing: () => Promise<void>;
   stopSharing: () => void;
 }
@@ -177,6 +181,9 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
   const [isHost, setIsHost] = useState(false);
   const [viewerCount, setViewerCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  /** true quando o navegador bloqueou o autoplay com som e o vídeo está
+   * tocando mudo até o espectador clicar em "ativar som". */
+  const [needsUnmute, setNeedsUnmute] = useState(false);
 
   const peerRef = useRef<Peer | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -284,9 +291,22 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       clearRetry();
       setStatus("watching");
       setError(null);
-      if (videoRef.current) {
-        videoRef.current.srcObject = remoteStream;
-      }
+      setNeedsUnmute(false);
+
+      const video = videoRef.current;
+      if (!video) return;
+      video.srcObject = remoteStream;
+
+      // Tenta tocar com som. Se o navegador bloquear autoplay com áudio
+      // (política padrão sem interação prévia do usuário), cai pra mudo —
+      // isso sempre é permitido — e avisa a UI pra mostrar um botão de
+      // "ativar som" (um clique já libera o áudio depois).
+      video.play().catch(() => {
+        if (!mountedRef.current) return;
+        video.muted = true;
+        setNeedsUnmute(true);
+        void video.play();
+      });
     });
 
     call.on("close", () => {
@@ -495,6 +515,15 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     });
   }
 
+  /** Chamado pelo clique do usuário no botão "Ativar som" — libera o áudio. */
+  function unmute() {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = false;
+    setNeedsUnmute(false);
+    void video.play();
+  }
+
   // -----------------------------------------------------------------------
   // Bootstrap: entra como espectador assim que a sala é montada.
   // -----------------------------------------------------------------------
@@ -520,6 +549,8 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
     isSharing: isHost && status === "sharing",
     viewerCount,
     error,
+    needsUnmute,
+    unmute,
     startSharing,
     stopSharing,
   };
