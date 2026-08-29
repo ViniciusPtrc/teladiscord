@@ -380,6 +380,15 @@ export function useWebRTC(roomId: string): UseWebRTCResult {
       if (!video) return;
       video.srcObject = remoteStream;
 
+      // Espectador SEMPRE quer ouvir. Precisa ser explícito aqui: se este
+      // mesmo cliente já foi host antes (mesmo <video>, `videoRef.current.muted
+      // = true` em startSharing), o elemento continua mudo — a prop
+      // `muted={isHost}` do React não é reaplicada em re-render (bug conhecido
+      // do React: `muted` só vira propriedade na montagem inicial). Sem esta
+      // linha, o vídeo toca sem áudio e o botão "Ativar som" nem aparece,
+      // porque o play() abaixo dá certo.
+      video.muted = false;
+
       // Tenta tocar com som. Se o navegador bloquear autoplay com áudio
       // (política padrão sem interação prévia do usuário), cai pra mudo —
       // isso sempre é permitido — e avisa a UI pra mostrar um botão de
